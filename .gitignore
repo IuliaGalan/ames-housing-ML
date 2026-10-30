@@ -222,3 +222,11 @@ __marimo__/
 .idea/
 
 *.csv
+
+# --- Proiect: date si artefacte generate local ---
+data/raw/
+data/processed/
+*.db
+*.joblib
+*.pkl
+.vscode/
