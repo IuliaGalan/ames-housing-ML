@@ -11,10 +11,20 @@ dependencies = [
     "matplotlib (>=3.11.2,<4.0.0)",
     "scikit-learn (>=1.9.1,<2.0.0)",
     "seaborn (>=0.13.2,<0.14.0)",
-    "jupyter (>=1.1.1,<2.0.0)"
+    "jupyter (>=1.1.1,<2.0.0)",
+    "xgboost (>=3.4.1,<4.0.0)",
+    "graphviz (>=0.21,<0.22)",
+    "plotly (>=7.1.0,<8.0.0)",
+    "optuna (>=5.0.0,<6.0.0)",
+    "anywidget (>=0.11.0,<0.12.0)"
 ]
 
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "scipy-stubs (>=1.18.1.1,<2.0.0.0)"
+]

@@ -4,8 +4,11 @@ import numpy as np
 import pandas as pd
 
 from sklearn.compose import ColumnTransformer
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
+    confusion_matrix,
+    roc_auc_score,
     accuracy_score,
     average_precision_score,
     classification_report,
@@ -21,6 +24,31 @@ from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, label_binarize
 
 PRICE_BINS = [-np.inf, 100000, 130000, 180000, 250000, 400000, np.inf]
 CLASSES = np.arange(6)
+
+
+class NativeCategoricalEncoder(BaseEstimator, TransformerMixin):
+    """Keeps nominal columns as pandas category, learning levels on fit data only."""
+
+    def fit(self, X, y=None):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("NativeCategoricalEncoder asteapta un DataFrame pandas.")
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.categories_ = {
+            col: pd.Index(X[col].dropna().unique()) for col in self.feature_names_in_
+        }
+        return self
+
+    def transform(self, X):
+        if not isinstance(X, pd.DataFrame):
+            X = pd.DataFrame(X, columns=self.feature_names_in_)
+        else:
+            X = X.loc[:, list(self.feature_names_in_)].copy()
+        for col in self.feature_names_in_:
+            X[col] = pd.Categorical(X[col], categories=self.categories_[col])
+        return X
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.feature_names_in_ if input_features is None else input_features, dtype=object)
 
 
 def make_classes(sale_price):
@@ -64,9 +92,9 @@ def build_features(df, encoding="onehot"):
     if "SalePrice" not in df.columns:
         raise ValueError("Lipseste coloana obligatorie SalePrice.")
 
-    if encoding not in {"onehot", "ordinal"}:
+    if encoding not in {"onehot", "ordinal", "native"}:
         raise ValueError(
-            "Encoding trebuie sa fie 'onehot' sau 'ordinal'."
+            "Encoding trebuie sa fie 'onehot', 'ordinal' sau 'native'."
         )
 
     y = make_classes(df["SalePrice"])
@@ -241,15 +269,17 @@ def build_features(df, encoding="onehot"):
                 handle_unknown="ignore",
                 sparse_output=False
             )
-        else:
+            transformers.append(("nominal", nominal_encoder, nominal_cols))
+        elif encoding == "ordinal":
             nominal_encoder = OrdinalEncoder(
                 handle_unknown="use_encoded_value",
                 unknown_value=-1
             )
-
-        transformers.append(
-            ("nominal", nominal_encoder, nominal_cols)
-        )
+            transformers.append(("nominal", nominal_encoder, nominal_cols))
+        else:
+            # Learn category levels only on the current training fold; unseen
+            # validation/test categories are converted to missing values.
+            transformers.append(("nominal", NativeCategoricalEncoder(), nominal_cols))
 
     preprocessor = ColumnTransformer(
         transformers=transformers,
@@ -282,6 +312,8 @@ def evaluate(model, X_test, y_test, show_plots=True):
         )
 
     y_true = np.asarray(y_test)
+    if y_true.ndim != 1:
+        raise ValueError("y_test trebuie sa fie un vector unidimensional.")
 
     if not np.isin(y_true, CLASSES).all():
         raise ValueError(
@@ -321,6 +353,24 @@ def evaluate(model, X_test, y_test, show_plots=True):
             "Probabilitatile pe fiecare rand nu insumeaza 1."
         )
 
+    y_binary = label_binarize(y_true, classes=CLASSES)
+    roc_auc_per_class = {}
+    average_precision_per_class = {}
+    for i, class_id in enumerate(CLASSES):
+        # AUC is undefined if a class has no positive or no negative examples.
+        if np.unique(y_binary[:, i]).size == 2:
+            roc_auc_per_class[int(class_id)] = float(roc_auc_score(y_binary[:, i], y_proba[:, i]))
+        else:
+            roc_auc_per_class[int(class_id)] = float("nan")
+        average_precision_per_class[int(class_id)] = float(
+            average_precision_score(y_binary[:, i], y_proba[:, i])
+        ) if y_binary[:, i].sum() > 0 else float("nan")
+
+    cm = confusion_matrix(y_true, y_pred, labels=CLASSES)
+    defined_auc = [v for v in roc_auc_per_class.values() if np.isfinite(v)]
+    defined_ap = [v for v in average_precision_per_class.values() if np.isfinite(v)]
+    macro_auc = float(np.mean(defined_auc)) if defined_auc else float("nan")
+    macro_ap = float(np.mean(defined_ap)) if defined_ap else float("nan")
     results = {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision_macro": precision_score(
@@ -350,13 +400,28 @@ def evaluate(model, X_test, y_test, show_plots=True):
             labels=CLASSES,
             average="weighted",
             zero_division=0
-        )
+        ),
+        "roc_auc_macro_ovr": macro_auc,
+        "average_precision_macro": macro_ap,
+        "roc_auc_per_class": roc_auc_per_class,
+        "average_precision_per_class": average_precision_per_class,
+        "confusion_matrix": cm,
+        "classification_report": classification_report(
+            y_true, y_pred, labels=CLASSES, zero_division=0, output_dict=True
+        ),
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "y_proba": y_proba,
     }
 
     print("Rezultatele modelului:")
 
     for name, value in results.items():
-        print(f"{name}: {value:.4f}")
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            print(f"{name}: {value:.4f}")
+    print("ROC-AUC per clasa:", {k: round(v, 4) for k, v in roc_auc_per_class.items()})
+    print("Average Precision per clasa:", {k: round(v, 4) for k, v in average_precision_per_class.items()})
+    print("Matricea de confuzie:\n", cm)
 
     print("\nClassification report:")
 
@@ -396,7 +461,7 @@ def evaluate(model, X_test, y_test, show_plots=True):
                 y_proba[:, i]
             )
 
-            roc_auc = auc(fpr, tpr)
+            roc_auc = roc_auc_per_class[int(i)]
 
             plt.plot(
                 fpr,

@@ -1,3 +1,8 @@
+# Python 3.13 (vezi requires-python in pyproject.toml)
+# Instalare: pip install -r requirements.txt
+# Versiunile sunt cele din poetry.lock.
+
+# --- Lab 1: EDA, feature engineering, regresie liniara ---
 pandas==3.0.6
 numpy==2.5.3
 matplotlib==3.11.2
@@ -6,3 +11,13 @@ scikit-learn==1.9.1
 scipy==1.18.1
 jupyter==1.1.1
 ipykernel==7.4.0
+
+# --- Lab 2: XGBoost + Optuna (cerinta din PDF: pip install xgboost plotly optuna anywidget) ---
+xgboost==3.4.1
+optuna==5.0.0
+plotly==7.1.0
+anywidget==0.11.0
+
+# Pachetul Python pentru desenarea arborilor (xgboost.plot_tree).
+# ATENTIE: necesita si programul Graphviz instalat in sistem (comanda `dot`), vezi README.
+graphviz==0.21
