@@ -227,6 +227,7 @@ __marimo__/
 data/raw/
 data/processed/
 *.db
+!optuna_xgboost.db
 *.joblib
 *.pkl
 .vscode/
