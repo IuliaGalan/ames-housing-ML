@@ -912,3 +912,552 @@ def compare_onehot_native_cv(X_train, y_train, preprocessor, n_splits=5, n_estim
     raw = pd.DataFrame(rows)
     summary = raw.groupby("encoding")["macro_f1"].agg(["mean", "std", "min", "max"])
     return {"fold_scores": raw, "summary": summary}
+
+
+# ============================================================================
+# BONUS (Partea C): LightGBM pe aceleasi features
+# ----------------------------------------------------------------------------
+# Echivalentul pentru LightGBM al functiilor XGBoost de mai sus. Folosesc
+# aceleasi date (load_data, make_split), aceleasi folduri (make_folds),
+# aceleasi ponderi (class_weights) si aceleasi metrici (evaluate_model),
+# ca cele doua modele sa poata fi comparate direct.
+# tree_frame, plot_tree_generic si plot_structure_comparison functioneaza
+# atat pentru XGBoost, cat si pentru LightGBM (pentru comparatia arborilor).
+# ============================================================================
+import time
+
+try:
+    import lightgbm as lgb
+    from lightgbm import LGBMClassifier
+except ImportError:  # restul modulului ramane utilizabil si fara lightgbm instalat
+    lgb = None
+    LGBMClassifier = None
+
+
+def _require_lgb():
+    if lgb is None:
+        raise ImportError("Functiile LightGBM necesita pachetul lightgbm: pip install lightgbm")
+
+
+# hiperparametri de baza, alesi paralel cu BASE_PARAMS de la XGBoost
+LGB_BASE_PARAMS = dict(
+    objective="multiclass",
+    n_estimators=1000,          # numarul real de runde il decide early stopping
+    learning_rate=0.1,
+    num_leaves=31,              # parametrul principal de complexitate (arbori crescuti frunza cu frunza)
+    max_depth=-1,               # fara limita de adancime; complexitatea e limitata de num_leaves
+    min_child_samples=20,       # numarul minim de case dintr-o frunza
+    subsample=0.8,
+    subsample_freq=1,           # LightGBM aplica subsample doar daca subsample_freq > 0
+    colsample_bytree=0.8,
+    min_split_gain=0.0,         # echivalentul lui gamma din XGBoost
+    reg_lambda=1.0,
+    random_state=SEED,
+    n_jobs=-1,
+    verbose=-1,                 # fara mesaje la fiecare antrenare
+    deterministic=True,         # rezultate reproductibile
+    force_row_wise=True,
+)
+
+# spatiul de cautare pentru Optuna (stabilit pe baza sweep-urilor din notebook-ul LightGBM)
+LGB_SEARCH_SPACE = {
+    "num_leaves": (4, 64, "log"),
+    "learning_rate": (0.01, 0.3, "log"),
+    "n_estimators": (100, 800),
+    "min_child_samples": (5, 40, "log"),
+    "subsample": (0.5, 1.0),
+    "colsample_bytree": (0.2, 1.0),
+    "min_split_gain": (0.0, 1.0),
+    "reg_lambda": (1e-2, 20.0, "log"),
+    "sample_weight_balanced": [False, True],
+}
+
+
+def fit_lgb(
+    X_train,
+    y_train,
+    preprocessor,
+    params=None,
+    early_stopping=True,
+    early_stopping_rounds=30,
+    val_size=0.15,
+    use_class_weight=True,
+    seed=SEED,
+    refit_full=True,
+):
+    """Antreneaza LightGBM fara leakage si returneaza un Pipeline fitat (aceeasi logica ca fit_xgb).
+
+    Cu early_stopping=True: imparte numai TRAIN in fit/validare, alege numarul de runde
+    pe validare, apoi (implicit) reantreneaza pe tot X_train cu numarul de runde ales.
+    Testul nu este accesat.
+    """
+    _require_lgb()
+    p = {**LGB_BASE_PARAMS, **(params or {})}
+    prep = clone(preprocessor).set_output(transform="pandas")
+    history, selected_iteration = None, None
+
+    if early_stopping:
+        X_fit, X_val, y_fit, y_val = train_test_split(
+            X_train, y_train, test_size=val_size, stratify=y_train, random_state=seed
+        )
+        prep_select = clone(prep).set_output(transform="pandas")
+        A_fit = prep_select.fit_transform(X_fit)
+        A_val = prep_select.transform(X_val)
+        selector = LGBMClassifier(**p)
+        selector.fit(
+            A_fit,
+            y_fit,
+            sample_weight=class_weights(y_fit, use_class_weight),
+            eval_X=(A_fit, A_val),
+            eval_y=(y_fit, y_val),
+            eval_names=["train", "validare"],
+            callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False)],
+        )
+        selected_rounds = int(selector.best_iteration_) or int(p["n_estimators"])
+        history = selector.evals_result_
+        selected_iteration = selected_rounds - 1
+
+        if refit_full:
+            A_train = prep.fit_transform(X_train)
+            clf = LGBMClassifier(**{**p, "n_estimators": selected_rounds})
+            clf.fit(A_train, y_train, sample_weight=class_weights(y_train, use_class_weight))
+        else:
+            prep, clf = prep_select, selector
+    else:
+        A_train = prep.fit_transform(X_train)
+        clf = LGBMClassifier(**p)
+        clf.fit(A_train, y_train, sample_weight=class_weights(y_train, use_class_weight))
+
+    fitted = Pipeline([("preprocessor", prep), ("classifier", clf)])
+    fitted._early_stopping_history = history
+    fitted._early_stopping_best_iteration = selected_iteration
+    fitted._early_stopping_selected_rounds = selected_iteration + 1 if selected_iteration is not None else None
+    fitted._use_class_weight = bool(use_class_weight)
+    return fitted
+
+
+def lgb_cross_validation(params, folds, use_class_weight=True):
+    """Macro-F1 mediu si deviatia standard pe foldurile din make_folds (folosita de Optuna)."""
+    _require_lgb()
+    p = {**LGB_BASE_PARAMS, **params}
+    scores = []
+    for A, y, B, yv in folds:
+        clf = LGBMClassifier(**p)
+        clf.fit(A, y, sample_weight=class_weights(y, use_class_weight))
+        scores.append(f1_score(yv, clf.predict(B), average="macro", labels=CLASSES, zero_division=0))
+    return float(np.mean(scores)), float(np.std(scores))
+
+
+def plot_lgb_training_curve(model, save_dir=None):
+    """Curba de invatare (multi_logloss pe train si validare, pe runde) din etapa de early stopping."""
+    ev = getattr(model, "_early_stopping_history", None)
+    if not ev:
+        print("Curba nu este disponibila: modelul a fost antrenat fara early stopping.")
+        return None
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for name, style in (("train", "--"), ("validare", "-")):
+        if name in ev:
+            ax.plot(ev[name]["multi_logloss"], style, label=name)
+    bi = getattr(model, "_early_stopping_best_iteration", None)
+    if bi is not None:
+        ax.axvline(bi, color="red", ls="--", label=f"best_iteration = {bi}")
+    ax.set_xlabel("runda de boosting")
+    ax.set_ylabel("multi_logloss")
+    ax.set_title("Curba de invatare LightGBM (early stopping)")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    _finish(fig, "LGB1_training_curve", save_dir)
+
+
+# ---------------------------------------------------------------- sweep-uri manuale
+LGB_SWEEP_BASE = {**LGB_BASE_PARAMS, "n_estimators": 150}
+
+LGB_SWEEP_GRID = {
+    "num_leaves": [4, 8, 15, 31, 63, 127],
+    "min_child_samples": [5, 10, 20, 40, 80],
+    "min_split_gain": [0.0, 0.25, 0.5, 1.0, 2.0],
+    "subsample": [0.5, 0.7, 0.85, 1.0],
+    "colsample_bytree": [0.2, 0.3, 0.5, 0.7, 1.0],
+    "reg_lambda": [0.0, 1.0, 10.0, 50.0],
+}
+
+
+def _lgb_metrics_at(clf, A, y, rounds=None):
+    proba = clf.predict_proba(A, num_iteration=rounds)
+    pred = proba.argmax(1)
+    return (
+        f1_score(y, pred, average="macro", labels=CLASSES, zero_division=0),
+        log_loss(y, proba, labels=CLASSES),
+    )
+
+
+def lgb_sweep_param(name, values, folds, base=None, use_class_weight=True):
+    """Variaza un singur hiperparametru LightGBM; acelasi format ca sweep_param (merge cu plot_sweep)."""
+    _require_lgb()
+    base = {**LGB_SWEEP_BASE, **(base or {})}
+    rows = []
+    for v in values:
+        tr_f1, va_f1, tr_ll, va_ll = [], [], [], []
+        for A, y, B, yv in folds:
+            clf = LGBMClassifier(**{**base, name: v})
+            clf.fit(A, y, sample_weight=class_weights(y, use_class_weight))
+            f, l = _lgb_metrics_at(clf, A, y)
+            tr_f1.append(f), tr_ll.append(l)
+            f, l = _lgb_metrics_at(clf, B, yv)
+            va_f1.append(f), va_ll.append(l)
+        rows.append(
+            {
+                "param": name, "value": v,
+                "train_f1": np.mean(tr_f1), "cv_f1": np.mean(va_f1), "cv_f1_std": np.std(va_f1, ddof=1),
+                "train_logloss": np.mean(tr_ll), "cv_logloss": np.mean(va_ll), "cv_logloss_std": np.std(va_ll, ddof=1),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def lgb_sweep_lr_nestimators(folds, learning_rates=(0.03, 0.1, 0.3), max_rounds=400, step=25, base=None, use_class_weight=True):
+    """learning_rate x n_estimators pentru LightGBM; acelasi format ca sweep_lr_nestimators (merge cu plot_lr_nestimators)."""
+    _require_lgb()
+    base = {**LGB_SWEEP_BASE, **(base or {})}
+    grid = list(range(step, max_rounds + 1, step))
+    rows = []
+    for lr in learning_rates:
+        acc = {n: {"tf": [], "vf": [], "tl": [], "vl": []} for n in grid}
+        for A, y, B, yv in folds:
+            clf = LGBMClassifier(**{**base, "learning_rate": lr, "n_estimators": max_rounds})
+            clf.fit(A, y, sample_weight=class_weights(y, use_class_weight))
+            for n in grid:
+                f, l = _lgb_metrics_at(clf, A, y, n)
+                acc[n]["tf"].append(f), acc[n]["tl"].append(l)
+                f, l = _lgb_metrics_at(clf, B, yv, n)
+                acc[n]["vf"].append(f), acc[n]["vl"].append(l)
+        for n in grid:
+            a = acc[n]
+            rows.append(
+                {
+                    "learning_rate": lr, "n_estimators": n,
+                    "train_f1": np.mean(a["tf"]), "cv_f1": np.mean(a["vf"]), "cv_f1_std": np.std(a["vf"], ddof=1),
+                    "train_logloss": np.mean(a["tl"]), "cv_logloss": np.mean(a["vl"]),
+                    "cv_logloss_std": np.std(a["vl"], ddof=1),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------- arbori (XGBoost si LightGBM)
+def _model_kind(model):
+    _, clf = get_parts(model)
+    if LGBMClassifier is not None and isinstance(clf, LGBMClassifier):
+        return "lightgbm"
+    if isinstance(clf, XGBClassifier):
+        return "xgboost"
+    raise TypeError("Modelul trebuie sa fie XGBClassifier sau LGBMClassifier (eventual intr-un Pipeline).")
+
+
+def _lgb_name_map(model):
+    """LightGBM inlocuieste spatiile din numele coloanelor cu '_'; refacem numele originale (aceeasi ordine)."""
+    prep, clf = get_parts(model)
+    internal = clf.booster_.feature_name()
+    original = list(prep.get_feature_names_out()) if prep is not None else internal
+    return dict(zip(internal, original))
+
+
+def tree_frame(model, trees=None):
+    """Toate nodurile arborilor intr-un tabel comun pentru XGBoost si LightGBM.
+
+    Coloane: tree, node_id, left, right, is_leaf, feature, op, threshold, gain, cover, value, depth.
+    La ambele modele, in clasificarea multiclasa indexul arborelui este runda * 6 + clasa.
+    """
+    kind = _model_kind(model)
+    if kind == "xgboost":
+        df = get_booster(model).trees_to_dataframe()
+        if trees is not None:
+            df = df[df["Tree"].isin(trees)]
+        depth = {}
+        rows = []
+        for r in df.itertuples(index=False):
+            d = depth.get(r.ID, 0)
+            leaf = r.Feature == "Leaf"
+            if not leaf:
+                depth[r.Yes] = d + 1
+                depth[r.No] = d + 1
+            rows.append({
+                "tree": r.Tree, "node_id": r.ID,
+                "left": None if leaf else r.Yes, "right": None if leaf else r.No,
+                "is_leaf": leaf, "feature": None if leaf else r.Feature, "op": "<",
+                "threshold": np.nan if leaf else r.Split,
+                "gain": 0.0 if leaf else r.Gain, "cover": r.Cover,
+                "value": r.Gain if leaf else np.nan, "depth": d,
+            })
+        return pd.DataFrame(rows)
+
+    _, clf = get_parts(model)
+    df = clf.booster_.trees_to_dataframe()
+    if trees is not None:
+        df = df[df["tree_index"].isin(trees)]
+    names = _lgb_name_map(model)
+    leaf = df["left_child"].isna()
+    return pd.DataFrame({
+        "tree": df["tree_index"].to_numpy(),
+        "node_id": df["node_index"].to_numpy(),
+        "left": df["left_child"].where(~leaf, None).to_numpy(),
+        "right": df["right_child"].where(~leaf, None).to_numpy(),
+        "is_leaf": leaf.to_numpy(),
+        "feature": df["split_feature"].map(names).where(~leaf, None).to_numpy(),
+        "op": "<=",
+        "threshold": df["threshold"].to_numpy(),
+        "gain": df["split_gain"].fillna(0.0).to_numpy(),
+        "cover": df["count"].to_numpy(),
+        "value": df["value"].where(leaf).to_numpy(),
+        "depth": (df["node_depth"] - 1).to_numpy(),
+    })
+
+
+def tree_structure_stats(model):
+    """Un rand per arbore: runda, clasa, numar de noduri si frunze, adancime maxima, feature-ul radacinii, gain total."""
+    fr = tree_frame(model)
+    g = fr.groupby("tree")
+    stats = pd.DataFrame({
+        "noduri": g.size(),
+        "frunze": g["is_leaf"].sum(),
+        "adancime_max": g["depth"].max(),
+        "gain_total": g["gain"].sum(),
+    })
+    roots = fr[fr["depth"] == 0].set_index("tree")["feature"]
+    stats["radacina"] = roots
+    stats["runda"] = stats.index // len(CLASSES)
+    stats["clasa"] = stats.index % len(CLASSES)
+    return stats[["runda", "clasa", "noduri", "frunze", "adancime_max", "radacina", "gain_total"]]
+
+
+def first_tree_idx_any(model, class_idx=0):
+    """Indexul primului arbore al clasei date (runda 0), pentru XGBoost si LightGBM."""
+    return class_idx
+
+
+def last_tree_idx_any(model, class_idx=0):
+    """Indexul arborelui clasei date din ultima runda pastrata de model."""
+    if _model_kind(model) == "xgboost":
+        n_rounds = best_n_rounds(model)
+    else:
+        _, clf = get_parts(model)
+        n_rounds = clf.booster_.num_trees() // len(CLASSES)
+    return (n_rounds - 1) * len(CLASSES) + class_idx
+
+
+def plot_tree_generic(model, tree_idx, title="", save_dir=None, name=None, max_label=22):
+    """Deseneaza un arbore cu matplotlib (nu necesita Graphviz). Merge pentru XGBoost si LightGBM.
+
+    Nodurile interne arata conditia de split (ramura stanga = conditia adevarata),
+    frunzele arata valoarea adaugata la scorul clasei (verde > 0, rosu < 0).
+    """
+    fr = tree_frame(model, trees=[tree_idx]).set_index("node_id")
+    if fr.empty:
+        raise ValueError(f"Arborele {tree_idx} nu exista in model.")
+    root = fr.index[fr["depth"] == 0][0]
+    pos, counter = {}, [0]
+
+    def place(n):
+        r = fr.loc[n]
+        if r["is_leaf"]:
+            pos[n] = (counter[0], -r["depth"])
+            counter[0] += 1
+        else:
+            place(r["left"])
+            place(r["right"])
+            pos[n] = ((pos[r["left"]][0] + pos[r["right"]][0]) / 2, -r["depth"])
+
+    place(root)
+    n_leaves, max_d = counter[0], int(fr["depth"].max())
+    fig, ax = plt.subplots(figsize=(max(10, 1.25 * n_leaves), max(4, 1.3 * (max_d + 1))))
+    for n, r in fr.iterrows():
+        if not r["is_leaf"]:
+            for child, lab in ((r["left"], "da"), (r["right"], "nu")):
+                (x0, y0), (x1, y1) = pos[n], pos[child]
+                ax.plot([x0, x1], [y0, y1], color="gray", lw=0.8, zorder=1)
+                ax.text((x0 + x1) / 2, (y0 + y1) / 2, lab, fontsize=6, color="gray", ha="center", va="center")
+    for n, r in fr.iterrows():
+        x, yy = pos[n]
+        if r["is_leaf"]:
+            txt, color = f"{r['value']:+.3f}", ("#c7e9c0" if r["value"] > 0 else "#fcbba1")
+        else:
+            feat = str(r["feature"])
+            feat = feat if len(feat) <= max_label else feat[: max_label - 1] + "…"
+            thr = 0.0 if abs(r["threshold"]) < 1e-6 else r["threshold"]  # LightGBM scrie pragul 0 ca 1e-35
+            txt, color = f"{feat}\n{r['op']} {thr:.4g}", "#c6dbef"
+        ax.text(x, yy, txt, ha="center", va="center", fontsize=6.5, zorder=2,
+                bbox=dict(boxstyle="round,pad=0.3", fc=color, ec="gray", lw=0.6))
+    ax.set_xlim(-0.8, n_leaves - 0.2)
+    ax.set_ylim(-max_d - 0.6, 0.6)
+    ax.axis("off")
+    ax.set_title(title or f"Arborele {tree_idx} ({n_leaves} frunze, adancime {max_d})")
+    _finish(fig, name or f"tree_{tree_idx}", save_dir)
+
+
+def plot_structure_comparison(models, save_dir=None):
+    """Compara forma arborilor mai multor modele: frunze per arbore, adancime maxima, adancimea frunzelor.
+
+    models: dict {nume: model fitat}. Returneaza un tabel cu statistici medii.
+    """
+    frames = {name: tree_frame(m) for name, m in models.items()}
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    summary = []
+    for name, fr in frames.items():
+        g = fr.groupby("tree")
+        leaves = g["is_leaf"].sum()
+        depth = g["depth"].max()
+        leaf_depths = fr.loc[fr["is_leaf"], "depth"]
+        axes[0].hist(leaves, bins=30, alpha=0.55, density=True, label=name)
+        axes[1].hist(depth, bins=np.arange(depth.max() + 2) - 0.5, alpha=0.55, density=True, label=name)
+        axes[2].hist(leaf_depths, bins=np.arange(leaf_depths.max() + 2) - 0.5, alpha=0.55, density=True, label=name)
+        summary.append({
+            "model": name, "arbori": int(fr["tree"].nunique()),
+            "frunze/arbore (medie)": leaves.mean(), "adancime max (medie)": depth.mean(),
+            "adancime max (maxim)": int(depth.max()),
+            "adancimea frunzelor (medie)": leaf_depths.mean(), "adancimea frunzelor (std)": leaf_depths.std(),
+        })
+    axes[0].set_xlabel("numar de frunze per arbore")
+    axes[1].set_xlabel("adancimea maxima a arborelui")
+    axes[2].set_xlabel("adancimea la care se afla o frunza")
+    for ax in axes:
+        ax.set_ylabel("proportie")
+        ax.legend()
+        ax.grid(alpha=0.3)
+    fig.suptitle("Structura arborilor: XGBoost (nivel cu nivel) vs LightGBM (frunza cu frunza)")
+    _finish(fig, "LGB2_structure_comparison", save_dir)
+    return pd.DataFrame(summary).set_index("model")
+
+
+# ---------------------------------------------------------------- importanta features
+def lgb_importance_table(model, aggregate=False):
+    """Importanta LightGBM: gain (mediu pe split), total_gain, split (numar de split-uri).
+
+    aggregate=True aduna coloanele one-hot inapoi la feature-ul original, ca la importance_table.
+    """
+    _, clf = get_parts(model)
+    booster = clf.booster_
+    name_map = _lgb_name_map(model)
+    names = [name_map[n] for n in booster.feature_name()]
+    df = pd.DataFrame({
+        "total_gain": booster.feature_importance(importance_type="gain"),
+        "split": booster.feature_importance(importance_type="split").astype(float),
+    }, index=names)
+    if aggregate:
+        origin = _origin_map(model, names)
+        df = df.groupby(df.index.map(origin))[["total_gain", "split"]].sum()
+    df["gain"] = (df["total_gain"] / df["split"].replace(0, np.nan)).fillna(0.0)
+    df["rank_gain"] = df["gain"].rank(ascending=False, method="min").astype(int)
+    df["rank_split"] = df["split"].rank(ascending=False, method="min").astype(int)
+    return df[["gain", "total_gain", "split", "rank_gain", "rank_split"]].sort_values("gain", ascending=False)
+
+
+def plot_lgb_importance(model, top=20, aggregate=True, save_dir=None):
+    """Doua grafice: gain mediu si numar de split-uri (feature-urile create in L1 sunt evidentiate)."""
+    imp = lgb_importance_table(model, aggregate=aggregate)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 0.35 * top + 2))
+    for ax, col, label in ((axes[0], "gain", "gain mediu pe split"), (axes[1], "split", "numar de split-uri")):
+        s = imp[col].sort_values(ascending=False).head(top)[::-1]
+        colors = ["#e6550d" if f in FE_FEATURES else "#3182bd" for f in s.index]
+        ax.barh(s.index, s.values, color=colors)
+        ax.set_xlabel(label)
+        ax.grid(alpha=0.3, axis="x")
+    fig.suptitle(f"Importanta features LightGBM (top {top}; portocaliu = feature-uri create in L1)")
+    _finish(fig, "LGB3_feature_importance", save_dir)
+    return imp
+
+
+def compare_importance(xgb_model, lgb_model, top=15, save_dir=None):
+    """Compara importanta XGBoost vs LightGBM pe aceeasi scara: procentul din gain-ul total al modelului.
+
+    Gain-urile absolute ale celor doua biblioteci nu sunt direct comparabile, procentele da.
+    """
+    x = importance_table(xgb_model, aggregate=True)
+    l = lgb_importance_table(lgb_model, aggregate=True)
+    tab = pd.DataFrame({
+        "XGBoost % gain": 100 * x["total_gain"] / x["total_gain"].sum(),
+        "LightGBM % gain": 100 * l["total_gain"] / l["total_gain"].sum(),
+        "XGBoost % split": 100 * x["split"] / x["split"].sum(),
+        "LightGBM % split": 100 * l["split"] / l["split"].sum(),
+    }).fillna(0.0)
+    tab = tab.sort_values("XGBoost % gain", ascending=False)
+    show = tab.loc[tab[["XGBoost % gain", "LightGBM % gain"]].max(axis=1).sort_values(ascending=False).index[:top]]
+    show = show.sort_values("XGBoost % gain")
+    fig, axes = plt.subplots(1, 2, figsize=(15, 0.4 * top + 2), sharey=True)
+    yy = np.arange(len(show))
+    for ax, kind in ((axes[0], "gain"), (axes[1], "split")):
+        ax.barh(yy - 0.2, show[f"XGBoost % {kind}"], 0.4, label="XGBoost")
+        ax.barh(yy + 0.2, show[f"LightGBM % {kind}"], 0.4, label="LightGBM")
+        ax.set_xlabel(f"% din {'gain-ul total' if kind == 'gain' else 'numarul total de split-uri'}")
+        ax.legend()
+        ax.grid(alpha=0.3, axis="x")
+    axes[0].set_yticks(yy)
+    axes[0].set_yticklabels(show.index)
+    fig.suptitle("Importanta features: XGBoost vs LightGBM (agregat pe feature-ul original)")
+    _finish(fig, "LGB4_importance_comparison", save_dir)
+    rho = spearmanr(tab["XGBoost % gain"], tab["LightGBM % gain"]).correlation
+    print(f"Corelatia Spearman intre clasamentele dupa gain: {rho:.3f}")
+    return tab
+
+
+# ---------------------------------------------------------------- procesul de invatare comparat
+def compare_learning_curves(X_train, y_train, preprocessor, configs, val_size=0.15, step=10, seed=SEED, save_dir=None):
+    """Antreneaza fiecare model pe aceeasi impartire fit/validare din TRAIN si inregistreaza, pe runde,
+    logloss-ul (train si validare) si macro-F1 pe validare.
+
+    configs: dict {nume: (tip, params, use_class_weight)}, tip = "xgboost" sau "lightgbm".
+    Returneaza (tabel pe runde, tabel cu timpii de antrenare).
+    """
+    X_fit, X_val, y_fit, y_val = train_test_split(
+        X_train, y_train, test_size=val_size, stratify=y_train, random_state=seed
+    )
+    prep = clone(preprocessor).set_output(transform="pandas")
+    A, B = prep.fit_transform(X_fit), prep.transform(X_val)
+    rows, times = [], {}
+    for name, (kind, params, use_w) in configs.items():
+        w = class_weights(y_fit, use_w)
+        # timpul de antrenare masurat separat, fara evaluarea pe runde
+        t0 = time.perf_counter()
+        if kind == "xgboost":
+            XGBClassifier(**{**BASE_PARAMS, **params}).fit(A, y_fit, sample_weight=w, verbose=False)
+        else:
+            _require_lgb()
+            LGBMClassifier(**{**LGB_BASE_PARAMS, **params}).fit(A, y_fit, sample_weight=w)
+        times[name] = time.perf_counter() - t0
+
+        if kind == "xgboost":
+            clf = XGBClassifier(**{**BASE_PARAMS, **params})
+            clf.fit(A, y_fit, sample_weight=w, eval_set=[(A, y_fit), (B, y_val)], verbose=False)
+            ev = clf.evals_result()
+            tr_ll, va_ll = ev["validation_0"]["mlogloss"], ev["validation_1"]["mlogloss"]
+            proba = lambda X, n: clf.predict_proba(X, iteration_range=(0, n))
+        else:
+            clf = LGBMClassifier(**{**LGB_BASE_PARAMS, **params})
+            clf.fit(A, y_fit, sample_weight=w, eval_X=(A, B), eval_y=(y_fit, y_val), eval_names=["train", "validare"])
+            ev = clf.evals_result_
+            tr_ll, va_ll = ev["train"]["multi_logloss"], ev["validare"]["multi_logloss"]
+            proba = lambda X, n: clf.predict_proba(X, num_iteration=n)
+        n_rounds = len(va_ll)
+        for n in sorted(set(list(range(step, n_rounds + 1, step)) + [n_rounds])):
+            rows.append({
+                "model": name, "runda": n,
+                "train_logloss": tr_ll[n - 1], "val_logloss": va_ll[n - 1],
+                "train_f1": f1_score(y_fit, proba(A, n).argmax(1), average="macro", labels=CLASSES, zero_division=0),
+                "val_f1": f1_score(y_val, proba(B, n).argmax(1), average="macro", labels=CLASSES, zero_division=0),
+            })
+    curves = pd.DataFrame(rows)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.8))
+    for name, g in curves.groupby("model", sort=False):
+        l, = axes[0].plot(g["runda"], g["val_logloss"], "-", label=f"{name} (validare)")
+        axes[0].plot(g["runda"], g["train_logloss"], "--", color=l.get_color(), alpha=0.7, label=f"{name} (train)")
+        axes[1].plot(g["runda"], g["val_f1"], "-", color=l.get_color(), label=f"{name} (validare)")
+        axes[1].plot(g["runda"], g["train_f1"], "--", color=l.get_color(), alpha=0.7, label=f"{name} (train)")
+    axes[0].set_ylabel("logloss")
+    axes[1].set_ylabel("macro-F1")
+    for ax in axes:
+        ax.set_xlabel("runda de boosting")
+        ax.legend()
+        ax.grid(alpha=0.3)
+    fig.suptitle("Procesul de invatare: XGBoost vs LightGBM (hiperparametrii optimizati, aceeasi validare)")
+    _finish(fig, "LGB5_learning_curves", save_dir)
+    return curves, pd.Series(times, name="timp antrenare (s)")

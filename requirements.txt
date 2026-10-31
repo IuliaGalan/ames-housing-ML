@@ -21,3 +21,6 @@ anywidget==0.11.0
 # Pachetul Python pentru desenarea arborilor (xgboost.plot_tree).
 # ATENTIE: necesita si programul Graphviz instalat in sistem (comanda `dot`), vezi README.
 graphviz==0.21
+
+# --- Bonus Lab 2: al doilea algoritm de boosted trees ---
+lightgbm==4.7.0
