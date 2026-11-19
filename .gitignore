@@ -232,3 +232,6 @@ data/processed/
 *.joblib
 *.pkl
 .vscode/
+# Lab 4: imaginile incarcate in memorie (cache) si modelele salvate sunt mari -> nu intra in git
+results/lab4/cache/
+results/lab4/models/

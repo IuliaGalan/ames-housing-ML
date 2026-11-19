@@ -24,3 +24,8 @@ graphviz==0.21
 
 # --- Bonus Lab 2: al doilea algoritm de boosted trees ---
 lightgbm==4.7.0
+
+# --- Lab 4: retele neuronale pentru imagini (PyTorch) ---
+torch==2.15.0
+torchvision==0.29.2
+torchinfo==1.8.0
