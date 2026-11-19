@@ -5,7 +5,9 @@ Toate experimentele (Partea 1, 2, 3) folosesc aceleasi functii de aici, ca rezul
   - aceleasi imagini, aceeasi dimensiune, aceeasi normalizare
   - aceleasi 5 fold-uri (StratifiedKFold, seed 42), salvate o singura data in results/lab4/folds.csv
   - acelasi antrenament (early stopping pe macro-F1 de validare)
-  - acelasi jurnal de rezultate: results/lab4/experiments.csv
+  - acelasi mod de salvare: fiecare experiment are folderul lui, results/lab4/runs/<name>/
+    (asa nu apar conflicte in git cand fiecare coleg adauga experimente pe branch-ul lui);
+    load_log() aduna toate experimentele terminate intr-un singur tabel
 
 Utilizare tipica intr-un notebook:
     import lab4_common
@@ -406,12 +408,12 @@ def run_experiment(cfg, folds=None, device=None, verbose=True):
       results/lab4/runs/<name>/fold<k>.json     - rezultatele fold-ului k (F1, acuratete, timp, epoci)
       results/lab4/runs/<name>/history.csv      - loss si F1 pe fiecare epoca (pt. grafice)
       results/lab4/runs/<name>/predictions.csv  - predictia pentru fiecare imagine (cand era in validare)
-      results/lab4/models/<name>.pt             - modelul din fold-ul 0 (pt. dimensiunea pe disc)
-      results/lab4/experiments.csv              - o linie cu rezumatul experimentului (jurnalul comun)
+      results/lab4/models/<name>.pt             - modelul din fold-ul 0 (pt. dimensiunea pe disc; nu intra in git)
+    Cand toate 5 fold-urile sunt gata, experimentul apare in tabelul comun load_log().
     Fold-urile deja terminate nu se mai ruleaza (se pot relua experimentele dupa o intrerupere).
 
     folds:  lista de fold-uri de rulat (implicit toate 5). Ex: folds=[0] pentru un test rapid;
-            in acest caz experimentul NU se scrie in experiments.csv (rezultatul nu e complet).
+            in acest caz experimentul NU apare in load_log() (rezultatul nu e complet).
     device: None = automat (GPU daca exista), sau "cpu" / "cuda".
     """
     cfg = make_config(**cfg)
@@ -478,8 +480,10 @@ def run_experiment(cfg, folds=None, device=None, verbose=True):
     done = sorted(run_dir.glob("fold*.json"))
     if len(done) == N_FOLDS:
         _merge_run_files(name)
-        return _write_summary(name)
-    print(f"[{name}] {len(done)}/{N_FOLDS} fold-uri terminate (rezultatul nu intra inca in experiments.csv).")
+        row = _summary(name)
+        print(f"[{name}] gata: macro-F1 = {row['val_f1_mean']:.3f} ± {row['val_f1_std']:.3f}")
+        return row
+    print(f"[{name}] {len(done)}/{N_FOLDS} fold-uri terminate (rezultatul nu apare inca in load_log()).")
     return None
 
 
@@ -495,8 +499,8 @@ def _merge_run_files(name):
             f.unlink()
 
 
-def _write_summary(name):
-    """Calculeaza rezumatul experimentului si il scrie (sau il actualizeaza) in experiments.csv."""
+def _summary(name):
+    """Rezumatul unui experiment terminat (o linie): media pe fold-uri + configurarea."""
     run_dir = _run_dir(name)
     cfg = json.loads((run_dir / "config.json").read_text())
     res = pd.DataFrame([json.loads((run_dir / f"fold{k}.json").read_text()) for k in range(N_FOLDS)])
@@ -511,15 +515,7 @@ def _write_summary(name):
         "device": res["device"].iloc[0],
         **{k: (json.dumps(v) if isinstance(v, list) else v) for k, v in cfg.items() if k != "name"},
     }
-    row = {k: (v.item() if hasattr(v, "item") else v) for k, v in row.items()}
-    log_path = OUT_DIR / "experiments.csv"
-    log = pd.read_csv(log_path) if log_path.exists() else pd.DataFrame()
-    if len(log):
-        log = log[log["name"] != name]
-    log = pd.concat([log, pd.DataFrame([row])], ignore_index=True)
-    log.to_csv(log_path, index=False)
-    print(f"[{name}] gata: macro-F1 = {row['val_f1_mean']:.3f} ± {row['val_f1_std']:.3f}")
-    return row
+    return {k: (v.item() if hasattr(v, "item") else v) for k, v in row.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -527,9 +523,20 @@ def _write_summary(name):
 # ---------------------------------------------------------------------------
 
 def load_log():
-    """Jurnalul comun cu toate experimentele terminate (o linie pe experiment)."""
-    path = OUT_DIR / "experiments.csv"
-    return pd.read_csv(path) if path.exists() else pd.DataFrame()
+    """
+    Tabelul comun cu toate experimentele terminate (o linie pe experiment), sortat dupa macro-F1.
+    Se construieste de fiecare data din folderele results/lab4/runs/, deci contine si experimentele
+    colegilor, dupa ce le aducem din git (merge / pull).
+    """
+    runs = OUT_DIR / "runs"
+    names = [d.name for d in sorted(runs.glob("*"))
+             if d.is_dir() and all((d / f"fold{k}.json").exists() for k in range(N_FOLDS))]
+    if not names:
+        return pd.DataFrame()
+    for n in names:
+        _merge_run_files(n)
+    log = pd.DataFrame([_summary(n) for n in names])
+    return log.sort_values("val_f1_mean", ascending=False, ignore_index=True)
 
 
 def load_history(name):
