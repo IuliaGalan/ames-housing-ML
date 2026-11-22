@@ -1,0 +1,29 @@
+{
+  "name": "p2_depth4_maxpool",
+  "img_size": 64,
+  "conv_layers": [
+    32,
+    32,
+    32,
+    32
+  ],
+  "kernel_size": 3,
+  "stride": 1,
+  "pooling": "max",
+  "recurrent": null,
+  "rnn_hidden": 128,
+  "fc_layers": [
+    128
+  ],
+  "activation": "relu",
+  "batch_norm": false,
+  "dropout": 0.0,
+  "augment": true,
+  "optimizer": "adam",
+  "lr": 0.001,
+  "weight_decay": 0.0,
+  "l1": 0.0,
+  "batch_size": 64,
+  "epochs": 30,
+  "patience": 5
+}
