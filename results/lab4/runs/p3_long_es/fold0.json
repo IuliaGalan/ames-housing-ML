@@ -1,0 +1,13 @@
+{
+  "fold": 0,
+  "val_f1": 0.7796155723508031,
+  "val_acc": 0.7806539509536785,
+  "train_f1": 0.8395981173734988,
+  "best_epoch": 24,
+  "epochs_run": 34,
+  "train_seconds": 492.1866030693054,
+  "infer_ms_per_image": 2.2292510690091416,
+  "n_params": 600709,
+  "model_mb": 2.2957658767700195,
+  "device": "cpu"
+}
